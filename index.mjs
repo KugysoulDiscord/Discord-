@@ -28,14 +28,13 @@ import {
 dotenv.config();
 
 // Connect to MongoDB
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-}).then(() => {
-  console.log('Connected to MongoDB');
-}).catch((err) => {
-  console.error('MongoDB connection error:', err);
-});
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => {
+    console.log('Connected to MongoDB');
+  })
+  .catch((err) => {
+    console.error('MongoDB connection error:', err);
+  });
 
 // Create user schema for leveling system
 const userSchema = new mongoose.Schema({
@@ -800,8 +799,27 @@ client.on("messageCreate", async message => {
             });
           }
         } else {
-          // Not a YouTube URL, use normal DisTube play
-          await distube.play(message.member.voice.channel, args.join(" "), {
+          // Check if it's a Spotify URL and format it correctly
+          let query = args.join(" ");
+          
+          // Check for Spotify URL patterns
+          if (query.includes("open.spotify.com")) {
+            // Extract the clean Spotify URL without extra parameters
+            const spotifyUrlMatch = query.match(/(https:\/\/open\.spotify\.com\/(?:track|album|playlist)\/[a-zA-Z0-9]+)/);
+            if (spotifyUrlMatch && spotifyUrlMatch[1]) {
+              query = spotifyUrlMatch[1];
+              message.channel.send(`🎵 Detected Spotify URL, optimizing format: ${query}`);
+            }
+          }
+          
+          // Remove any "spotify:" prefix if present
+          if (query.startsWith("spotify:")) {
+            query = query.replace("spotify:", "");
+            message.channel.send(`🎵 Removed 'spotify:' prefix for better compatibility`);
+          }
+          
+          // Not a YouTube URL, use normal DisTube play with possibly reformatted query
+          await distube.play(message.member.voice.channel, query, {
             member: message.member,
             textChannel: message.channel,
             message,
@@ -1025,8 +1043,8 @@ client.on("messageCreate", async message => {
             value: "Play a song from YouTube, Spotify, or a search query",
           },
           {
-            name: "!play spotify:<url>",
-            value: "Play a song from Spotify (supports tracks, albums, playlists)",
+            name: "!play <spotify_url>",
+            value: "Play a song from Spotify (supports tracks, albums, playlists) - URLs are automatically formatted",
           },
           {
             name: "!cookies <cookie_string>",
