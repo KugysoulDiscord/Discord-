@@ -13,6 +13,7 @@ import { execSync } from "child_process";
 import fetch from "node-fetch";
 import mongoose from "mongoose";
 import { setTimeout } from "timers/promises";
+import { Manager } from "erela.js"; // Import Erela.js untuk Lavalink
 import { 
   joinVoiceChannel, 
   createAudioPlayer, 
@@ -499,8 +500,8 @@ const distube = new DisTube(client, {
   plugins: [
     new SpotifyPlugin({
       api: {
-        clientId: "0e7b9b46993d4a9ab295da2da2dc5909",
-        clientSecret: "e2199abf29f84e8aa05269aa3710e6ae",
+        clientId: process.env.SPOTIFY_CLIENT_ID || "0e7b9b46993d4a9ab295da2da2dc5909",
+        clientSecret: process.env.SPOTIFY_CLIENT_SECRET || "e2199abf29f84e8aa05269aa3710e6ae",
       }
     }),
     new YtDlpPlugin({
@@ -509,6 +510,38 @@ const distube = new DisTube(client, {
     }),
   ],
 });
+
+// Inisialisasi Lavalink Manager
+const manager = new Manager({
+  // Konfigurasi node Lavalink
+  nodes: [
+    {
+      host: process.env.LAVALINK_HOST || "localhost", // Menggunakan host dari env atau default
+      port: parseInt(process.env.LAVALINK_PORT) || 2333, // Port default Lavalink
+      password: process.env.LAVALINK_PASSWORD || "youshallnotpass", // Password dari env atau default
+      secure: false,     // Gunakan true jika menggunakan SSL
+    },
+  ],
+  // Fungsi untuk mengirim data ke Discord
+  send: (id, payload) => {
+    const guild = client.guilds.cache.get(id);
+    if (guild) guild.shard.send(payload);
+  },
+  // Gunakan YouTube dan Spotify sebagai sumber
+  autoPlay: true,
+});
+
+// Helper function to format duration for Lavalink
+// Function to format duration for Lavalink tracks (milliseconds)
+function formatLavaDuration(ms) {
+  const seconds = Math.floor((ms / 1000) % 60);
+  const minutes = Math.floor((ms / (1000 * 60)) % 60);
+  const hours = Math.floor(ms / (1000 * 60 * 60));
+
+  return hours > 0
+    ? `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`
+    : `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
 
 // Set up event listeners for DisTube
 distube
@@ -522,6 +555,62 @@ distube
       duration: song.formattedDuration,
       author: song.uploader?.name || "Unknown",
     };
+    
+// Set up event listeners for Lavalink
+manager
+  .on("nodeConnect", (node) => {
+    console.log(`Lavalink node ${node.options.identifier} connected.`);
+  })
+  .on("nodeError", (node, error) => {
+    console.log(`Lavalink node ${node.options.identifier} had an error: ${error.message}`);
+  })
+  .on("trackStart", (player, track) => {
+    const channel = client.channels.cache.get(player.textChannel);
+    if (channel) {
+      const embed = new EmbedBuilder()
+        .setColor(0x3498DB)
+        .setTitle("🎵 Now Playing")
+        .setDescription(`[${track.title}](${track.uri})`)
+        .setThumbnail(track.thumbnail || track.displayThumbnail())
+        .addFields(
+          { name: "Duration", value: formatDuration(track.duration), inline: true },
+          { name: "Requested By", value: track.requester.tag, inline: true }
+        )
+        .setTimestamp();
+      
+      channel.send({ embeds: [embed] });
+    }
+    
+    globalState.isPlaying = true;
+    globalState.isPaused = false;
+    globalState.currentTrack = {
+      title: track.title,
+      url: track.uri,
+      thumbnail: track.thumbnail || track.displayThumbnail(),
+      duration: track.duration,
+      author: track.author || "Unknown",
+    };
+  })
+  .on("queueEnd", (player) => {
+    const channel = client.channels.cache.get(player.textChannel);
+    if (channel) {
+      channel.send("✅ Queue has ended! Add more songs to keep the party going!");
+    }
+    
+    globalState.isPlaying = false;
+    globalState.isPaused = false;
+    globalState.currentTrack = null;
+    globalState.queue = [];
+  })
+  .on("playerMove", (player, oldChannel, newChannel) => {
+    if (!newChannel) {
+      player.destroy();
+      const channel = client.channels.cache.get(player.textChannel);
+      if (channel) {
+        channel.send("❌ I've been disconnected from the voice channel.");
+      }
+    }
+  });
     globalState.queue = queue.songs.slice(1).map(s => ({
       title: s.name,
       url: s.url,
@@ -689,6 +778,10 @@ client.once("ready", () => {
     status: "online",
   });
   
+  // Initialize Lavalink
+  manager.init(client.user.id);
+  console.log("Lavalink manager initialized");
+  
   // Check and create guild settings for all guilds
   client.guilds.cache.forEach(async (guild) => {
     try {
@@ -741,6 +834,9 @@ client.on("guildMemberAdd", async (member) => {
 });
 
 // Create a message event listener
+// Forward raw events to Lavalink
+client.on("raw", (d) => manager.updateVoiceState(d));
+
 client.on("messageCreate", async message => {
   // Ignore messages from bots
   if (message.author.bot) return;
@@ -783,6 +879,87 @@ client.on("messageCreate", async message => {
       message.channel.send(`🔍 Searching for: ${args.join(" ")}`);
       
       try {
+        const query = args.join(" ");
+        
+        // Process Spotify URLs for better compatibility
+        if (query.includes("open.spotify.com")) {
+          // Extract the clean Spotify URL without extra parameters
+          const spotifyUrlMatch = query.match(/(https:\/\/open\.spotify\.com\/(?:track|album|playlist)\/[a-zA-Z0-9]+)/);
+          if (spotifyUrlMatch && spotifyUrlMatch[1]) {
+            query = spotifyUrlMatch[1];
+            message.channel.send(`🎵 Detected Spotify URL, optimizing format: ${query}`);
+          }
+        }
+        
+        // Handle Spotify URI format (spotify:track:id, spotify:album:id, spotify:playlist:id)
+        if (query.startsWith("spotify:")) {
+          const parts = query.split(":");
+          if (parts.length === 3) {
+            const [_, type, id] = parts;
+            if (["track", "album", "playlist"].includes(type)) {
+              query = `https://open.spotify.com/${type}/${id}`;
+              message.channel.send(`🎵 Converting Spotify URI to URL: ${query}`);
+            }
+          }
+        }
+        
+        // This section is now handled by the previous block
+        
+        // Try to use Lavalink first (if available)
+        try {
+          // Get or create a player
+          const player = manager.players.get(message.guild.id) || manager.create({
+            guild: message.guild.id,
+            voiceChannel: message.member.voice.channel.id,
+            textChannel: message.channel.id,
+          });
+          
+          // Connect to the voice channel
+          player.connect();
+          
+          // Search for the song
+          const res = await manager.search(query, message.author);
+          
+          // Handle search results
+          if (res.loadType === "LOAD_FAILED") {
+            // If Lavalink fails, fall back to DisTube
+            console.log("Lavalink search failed, falling back to DisTube");
+            throw new Error("Lavalink search failed");
+          } else if (res.loadType === "NO_MATCHES") {
+            // If no matches found, fall back to DisTube
+            console.log("No matches found with Lavalink, falling back to DisTube");
+            throw new Error("No matches found with Lavalink");
+          } else if (res.loadType === "PLAYLIST_LOADED") {
+            // Add all tracks from playlist
+            player.queue.add(res.tracks);
+            
+            // Play the track if not already playing
+            if (!player.playing && !player.paused && !player.queue.size) {
+              player.play();
+            }
+            
+            // Send success message
+            message.channel.send(`✅ Added playlist to queue: **${res.playlist.name}** with ${res.tracks.length} tracks`);
+            return; // Exit early since we successfully used Lavalink
+          } else {
+            // Add the track(s) to the queue
+            player.queue.add(res.tracks[0]);
+            
+            // Play the track if not already playing
+            if (!player.playing && !player.paused && !player.queue.size) {
+              player.play();
+            }
+            
+            // Send success message
+            message.channel.send(`✅ Added to queue: **${res.tracks[0].title}**`);
+            return; // Exit early since we successfully used Lavalink
+          }
+        } catch (lavaError) {
+          console.log("Falling back to DisTube due to error:", lavaError.message);
+          // Continue with DisTube as fallback
+        }
+        
+        // Fall back to DisTube if Lavalink fails
         // Check if it's a YouTube URL and we should try Innertube API first
         const url = args.join(" ");
         const videoId = extractYouTubeVideoId(url);
@@ -913,13 +1090,22 @@ client.on("messageCreate", async message => {
         return message.reply("❌ You need to be in a voice channel to stop music!");
       }
       
+      // Try to stop Lavalink player first
+      const lavaPlayer = manager.players.get(message.guild.id);
+      if (lavaPlayer) {
+        lavaPlayer.destroy();
+        message.channel.send("⏹️ Music stopped! (Lavalink)");
+        break;
+      }
+      
+      // Fall back to DisTube if no Lavalink player
       const queue = distube.getQueue(message);
       if (!queue) {
         return message.reply("❌ There is nothing playing!");
       }
       
       queue.stop();
-      message.channel.send("⏹️ Music stopped!");
+      message.channel.send("⏹️ Music stopped! (DisTube)");
       break;
       
     case "skip":
@@ -928,6 +1114,20 @@ client.on("messageCreate", async message => {
         return message.reply("❌ You need to be in a voice channel to skip music!");
       }
       
+      // Try to skip with Lavalink first
+      const lavaSkipPlayer = manager.players.get(message.guild.id);
+      if (lavaSkipPlayer) {
+        try {
+          lavaSkipPlayer.stop();
+          message.channel.send("⏭️ Skipped to the next song! (Lavalink)");
+          break;
+        } catch (error) {
+          console.error("Lavalink skip error:", error);
+          // Fall back to DisTube if Lavalink skip fails
+        }
+      }
+      
+      // Fall back to DisTube if no Lavalink player or if Lavalink skip failed
       const skipQueue = distube.getQueue(message);
       if (!skipQueue) {
         return message.reply("❌ There is nothing playing!");
@@ -935,7 +1135,7 @@ client.on("messageCreate", async message => {
       
       try {
         skipQueue.skip();
-        message.channel.send("⏭️ Skipped to the next song!");
+        message.channel.send("⏭️ Skipped to the next song! (DisTube)");
       } catch (error) {
         message.reply(`❌ Error: ${error.message}`);
       }
@@ -946,17 +1146,30 @@ client.on("messageCreate", async message => {
         return message.reply("❌ You need to be in a voice channel to pause music!");
       }
       
+      // Try to pause with Lavalink first
+      const lavaPausePlayer = manager.players.get(message.guild.id);
+      if (lavaPausePlayer) {
+        if (lavaPausePlayer.paused) {
+          return message.reply("⚠️ The music is already paused! (Lavalink)");
+        }
+        
+        lavaPausePlayer.pause(true);
+        message.channel.send("⏸️ Music paused! (Lavalink)");
+        break;
+      }
+      
+      // Fall back to DisTube if no Lavalink player
       const pauseQueue = distube.getQueue(message);
       if (!pauseQueue) {
         return message.reply("❌ There is nothing playing!");
       }
       
       if (pauseQueue.paused) {
-        return message.reply("⚠️ The music is already paused!");
+        return message.reply("⚠️ The music is already paused! (DisTube)");
       }
       
       pauseQueue.pause();
-      message.channel.send("⏸️ Music paused!");
+      message.channel.send("⏸️ Music paused! (DisTube)");
       break;
       
     case "resume":
@@ -964,24 +1177,63 @@ client.on("messageCreate", async message => {
         return message.reply("❌ You need to be in a voice channel to resume music!");
       }
       
+      // Try to resume with Lavalink first
+      const lavaResumePlayer = manager.players.get(message.guild.id);
+      if (lavaResumePlayer) {
+        if (!lavaResumePlayer.paused) {
+          return message.reply("⚠️ The music is already playing! (Lavalink)");
+        }
+        
+        lavaResumePlayer.pause(false);
+        message.channel.send("▶️ Music resumed! (Lavalink)");
+        break;
+      }
+      
+      // Fall back to DisTube if no Lavalink player
       const resumeQueue = distube.getQueue(message);
       if (!resumeQueue) {
         return message.reply("❌ There is nothing to resume!");
       }
       
       if (!resumeQueue.paused) {
-        return message.reply("⚠️ The music is already playing!");
+        return message.reply("⚠️ The music is already playing! (DisTube)");
       }
       
       resumeQueue.resume();
-      message.channel.send("▶️ Music resumed!");
+      message.channel.send("▶️ Music resumed! (DisTube)");
       break;
       
     case "queue":
     case "q":
+      // Try to get queue from Lavalink first
+      const lavaQueuePlayer = manager.players.get(message.guild.id);
+      if (lavaQueuePlayer) {
+        const currentTrack = lavaQueuePlayer.queue.current;
+        const queue = lavaQueuePlayer.queue;
+        
+        if (!currentTrack) {
+          return message.reply("❌ There is nothing playing! (Lavalink)");
+        }
+        
+        let queueString = `Playing: ${currentTrack.title} - \`${formatLavaDuration(currentTrack.duration)}\` - Requested by ${currentTrack.requester.tag}\n`;
+        
+        if (queue.length > 0) {
+          queueString += queue
+            .map(
+              (track, i) =>
+                `${i + 1}. ${track.title} - \`${formatLavaDuration(track.duration)}\` - Requested by ${track.requester.tag}`
+            )
+            .join("\n");
+        }
+        
+        message.channel.send(`📋 **Current Queue (Lavalink)**\n${queueString}`);
+        break;
+      }
+      
+      // Fall back to DisTube if no Lavalink player
       const queueInfo = distube.getQueue(message);
       if (!queueInfo) {
-        return message.reply("❌ There is nothing playing!");
+        return message.reply("❌ There is nothing playing! (DisTube)");
       }
       
       const queueString = queueInfo.songs
@@ -991,7 +1243,7 @@ client.on("messageCreate", async message => {
         )
         .join("\n");
         
-      message.channel.send(`📋 **Current Queue**\n${queueString}`);
+      message.channel.send(`📋 **Current Queue (DisTube)**\n${queueString}`);
       break;
       
     case "loop":
@@ -1040,31 +1292,63 @@ client.on("messageCreate", async message => {
         return message.reply("❌ You need to be in a voice channel to change volume!");
       }
       
-      const volQueue = distube.getQueue(message);
-      if (!volQueue) {
-        return message.reply("❌ There is nothing playing!");
-      }
-      
       const volume = parseInt(args[0]);
       if (isNaN(volume) || volume < 0 || volume > 100) {
         return message.reply("⚠️ Please provide a valid volume level between 0 and 100!");
       }
       
+      // Try to set volume with Lavalink first
+      const lavaVolumePlayer = manager.players.get(message.guild.id);
+      if (lavaVolumePlayer) {
+        lavaVolumePlayer.setVolume(volume);
+        globalState.volume = volume;
+        message.channel.send(`🔊 Volume set to: **${volume}%** (Lavalink)`);
+        break;
+      }
+      
+      // Fall back to DisTube if no Lavalink player
+      const volQueue = distube.getQueue(message);
+      if (!volQueue) {
+        return message.reply("❌ There is nothing playing! (DisTube)");
+      }
+      
       volQueue.setVolume(volume);
       globalState.volume = volume;
-      message.channel.send(`🔊 Volume set to: **${volume}%**`);
+      message.channel.send(`🔊 Volume set to: **${volume}%** (DisTube)`);
       break;
       
     case "nowplaying":
     case "np":
+      // Try to get current song from Lavalink first
+      const lavaNpPlayer = manager.players.get(message.guild.id);
+      if (lavaNpPlayer && lavaNpPlayer.queue.current) {
+        const currentTrack = lavaNpPlayer.queue.current;
+        
+        const npEmbed = new EmbedBuilder()
+          .setColor(0x3498DB)
+          .setTitle("🎵 Now Playing (Lavalink)")
+          .setDescription(`[${currentTrack.title}](${currentTrack.uri})`)
+          .setThumbnail(currentTrack.thumbnail || currentTrack.displayThumbnail())
+          .addFields(
+            { name: "Duration", value: formatLavaDuration(currentTrack.duration), inline: true },
+            { name: "Requested By", value: currentTrack.requester.tag, inline: true },
+            { name: "Author", value: currentTrack.author || "Unknown", inline: true }
+          )
+          .setTimestamp();
+        
+        message.channel.send({ embeds: [npEmbed] });
+        break;
+      }
+      
+      // Fall back to DisTube if no Lavalink player
       const npQueue = distube.getQueue(message);
       if (!npQueue) {
-        return message.reply("❌ There is nothing playing!");
+        return message.reply("❌ There is nothing playing! (DisTube)");
       }
       
       const song = npQueue.songs[0];
       message.channel.send(
-        `🎵 **Now Playing**\n${song.name} - \`${song.formattedDuration}\` - Requested by ${song.user}`
+        `🎵 **Now Playing (DisTube)**\n${song.name} - \`${song.formattedDuration}\` - Requested by ${song.user}`
       );
       break;
       
@@ -1080,11 +1364,19 @@ client.on("messageCreate", async message => {
           },
           {
             name: "!play <song>",
-            value: "Play a song from YouTube, Spotify, or a search query",
+            value: "Play a song from YouTube, Spotify, or a search query (uses Lavalink if available, falls back to DisTube)",
           },
           {
             name: "!play <spotify_url>",
             value: "Play a song from Spotify (supports tracks, albums, playlists) - URLs are automatically formatted",
+          },
+          {
+            name: "!play spotify:<track|album|playlist>:<id>",
+            value: "Play Spotify content using the Spotify URI format",
+          },
+          {
+            name: "!lavalink",
+            value: "Show Lavalink connection status and statistics",
           },
           {
             name: "!cookies <cookie_string>",
@@ -1127,6 +1419,19 @@ client.on("messageCreate", async message => {
           {
             name: "!rank <@user>",
             value: "Check another user's level and XP",
+          },
+          {
+            name: "!leaderboard",
+            value: "View the server's XP leaderboard",
+          },
+          // AI Commands
+          {
+            name: "🤖 AI Commands",
+            value: "Interact with AI assistant",
+          },
+          {
+            name: "!ai <prompt>",
+            value: "Ask the AI assistant a question or request help",
           },
           // Welcome message commands
           {
@@ -1214,6 +1519,43 @@ client.on("messageCreate", async message => {
       }
       break;
       
+    case "lavalink":
+      try {
+        // Get Lavalink nodes status
+        const nodes = manager.nodes;
+        
+        if (nodes.size === 0) {
+          return message.reply("❌ No Lavalink nodes are configured.");
+        }
+        
+        const statusEmbed = new EmbedBuilder()
+          .setColor(0x3498DB)
+          .setTitle('Lavalink Status')
+          .setDescription('Current status of Lavalink nodes:')
+          .setTimestamp();
+        
+        nodes.forEach(node => {
+          const status = node.connected ? '🟢 Connected' : '🔴 Disconnected';
+          const stats = node.stats ? 
+            `CPU: ${(node.stats.cpu.systemLoad * 100).toFixed(2)}%\n` +
+            `Memory: ${(node.stats.memory.used / 1024 / 1024).toFixed(2)} MB\n` +
+            `Players: ${node.stats.players}\n` +
+            `Playing: ${node.stats.playingPlayers}`
+            : 'No stats available';
+          
+          statusEmbed.addFields({
+            name: `Node: ${node.options.identifier || 'default'}`,
+            value: `Status: ${status}\nAddress: ${node.options.host}:${node.options.port}\n${stats}`
+          });
+        });
+        
+        message.reply({ embeds: [statusEmbed] });
+      } catch (error) {
+        console.error("Error checking Lavalink status:", error);
+        message.reply("❌ An error occurred while checking Lavalink status.");
+      }
+      break;
+      
     // Level command
     case "level":
     case "rank":
@@ -1258,6 +1600,112 @@ client.on("messageCreate", async message => {
       } catch (error) {
         console.error("Level command error:", error);
         message.reply("❌ An error occurred while fetching level data.");
+      }
+      break;
+      
+    case "leaderboard":
+    case "lb":
+      try {
+        // Get top 10 users by XP in the current guild
+        const topUsers = await User.find({ guildId: message.guild.id })
+          .sort({ xp: -1 })
+          .limit(10);
+        
+        if (topUsers.length === 0) {
+          return message.reply("No one has earned XP in this server yet!");
+        }
+        
+        // Create leaderboard entries
+        let leaderboardText = "";
+        
+        for (let i = 0; i < topUsers.length; i++) {
+          const user = topUsers[i];
+          try {
+            // Try to fetch the Discord user
+            const discordUser = await client.users.fetch(user.userId);
+            const username = discordUser ? discordUser.username : 'Unknown User';
+            
+            // Add medal emoji for top 3
+            let prefix = `${i + 1}.`;
+            if (i === 0) prefix = "🥇";
+            else if (i === 1) prefix = "🥈";
+            else if (i === 2) prefix = "🥉";
+            
+            leaderboardText += `${prefix} **${username}** - Level: ${user.level} (XP: ${user.xp})\n`;
+          } catch (error) {
+            console.error(`Error fetching user ${user.userId}:`, error);
+            leaderboardText += `${i + 1}. Unknown User - Level: ${user.level} (XP: ${user.xp})\n`;
+          }
+        }
+        
+        // Create leaderboard embed
+        const leaderboardEmbed = new EmbedBuilder()
+          .setColor(0x3498DB)
+          .setTitle(`🏆 XP Leaderboard - ${message.guild.name}`)
+          .setDescription(leaderboardText)
+          .setFooter({ text: `Requested by ${message.author.username}` })
+          .setTimestamp();
+        
+        message.reply({ embeds: [leaderboardEmbed] });
+      } catch (error) {
+        console.error("Leaderboard command error:", error);
+        message.reply("❌ An error occurred while fetching leaderboard data.");
+      }
+      break;
+      
+    // AI command
+    case "ai":
+      try {
+        if (!args.length) {
+          return message.reply("❌ Please provide a prompt for the AI!");
+        }
+        
+        const prompt = args.join(" ");
+        const loadingMessage = await message.channel.send("🤖 Thinking...");
+        
+        // Call the OpenRouter API
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: "openai/gpt-3.5-turbo",
+            messages: [
+              { 
+                role: "system", 
+                content: "You are a helpful Discord bot assistant. Provide concise, accurate, and friendly responses. Format your responses clearly with spacing between paragraphs for readability." 
+              },
+              { role: "user", content: prompt }
+            ],
+            max_tokens: 500
+          })
+        });
+        
+        const data = await response.json();
+        
+        if (data.error) {
+          console.error("AI API Error:", data.error);
+          await loadingMessage.delete();
+          return message.reply(`❌ Error: ${data.error.message || "Unknown error occurred"}`);
+        }
+        
+        const aiResponse = data.choices[0].message.content;
+        
+        // Create AI response embed
+        const aiEmbed = new EmbedBuilder()
+          .setColor(0x3498DB)
+          .setTitle("🤖 AI Response")
+          .setDescription(aiResponse)
+          .setFooter({ text: `Requested by ${message.author.username}` })
+          .setTimestamp();
+        
+        await loadingMessage.delete();
+        message.reply({ embeds: [aiEmbed] });
+      } catch (error) {
+        console.error("AI command error:", error);
+        message.reply("❌ An error occurred while processing your AI request.");
       }
       break;
       
@@ -2000,6 +2448,17 @@ server.listen(PORT, () => {
   console.log(`Dashboard running on port ${PORT}`);
   console.log(`Visit http://localhost:${PORT} to view the dashboard`);
 });
+
+// Load YouTube cookies from file if available
+try {
+  if (fs.existsSync('./cookies.txt')) {
+    const cookiesContent = fs.readFileSync('./cookies.txt', 'utf8');
+    console.log('Loading YouTube cookies from cookies.txt file...');
+    updateYouTubeCookies(cookiesContent);
+  }
+} catch (error) {
+  console.error('Error loading YouTube cookies from file:', error);
+}
 
 // Login to Discord with your client's token
 client.login(process.env.DISCORD_TOKEN);
