@@ -567,10 +567,62 @@ distube
 // Set up event listeners for Lavalink
 manager
   .on("nodeConnect", (node) => {
-    console.log(`Lavalink node ${node.options.identifier} connected.`);
+    console.log(`✅ Lavalink node ${node.options.identifier} connected successfully.`);
+    
+    // Send connection status to all guilds with active text channels
+    client.guilds.cache.forEach(guild => {
+      // Find a suitable text channel to send the message (system channel or first text channel)
+      const channel = guild.systemChannel || 
+                     guild.channels.cache.find(ch => 
+                       ch.type === ChannelType.GuildText && 
+                       ch.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)
+                     );
+      
+      if (channel) {
+        const embed = new EmbedBuilder()
+          .setColor(0x00FF00)
+          .setTitle("✅ Lavalink Connected")
+          .setDescription(`Successfully connected to Lavalink node: ${node.options.host}:${node.options.port}`)
+          .addFields(
+            { name: "Node", value: node.options.identifier || "main", inline: true },
+            { name: "Status", value: "Online", inline: true }
+          )
+          .setTimestamp()
+          .setFooter({ text: "Music system is now fully operational" });
+        
+        channel.send({ embeds: [embed] }).catch(err => 
+          console.error(`Could not send Lavalink connection message to ${guild.name}: ${err.message}`)
+        );
+      }
+    });
   })
   .on("nodeError", (node, error) => {
-    console.log(`Lavalink node ${node.options.identifier} had an error: ${error.message}`);
+    console.error(`❌ Lavalink node ${node.options.identifier} had an error: ${error.message}`);
+    
+    // Notify about the error in guilds
+    client.guilds.cache.forEach(guild => {
+      const channel = guild.systemChannel || 
+                     guild.channels.cache.find(ch => 
+                       ch.type === ChannelType.GuildText && 
+                       ch.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)
+                     );
+      
+      if (channel) {
+        const embed = new EmbedBuilder()
+          .setColor(0xFF0000)
+          .setTitle("❌ Lavalink Connection Error")
+          .setDescription(`Error connecting to Lavalink node: ${node.options.host}:${node.options.port}`)
+          .addFields(
+            { name: "Error", value: error.message, inline: false }
+          )
+          .setTimestamp()
+          .setFooter({ text: "Music system may not function properly" });
+        
+        channel.send({ embeds: [embed] }).catch(err => 
+          console.error(`Could not send Lavalink error message to ${guild.name}: ${err.message}`)
+        );
+      }
+    });
   })
   .on("trackStart", (player, track) => {
     const channel = client.channels.cache.get(player.textChannel);
@@ -898,20 +950,11 @@ client.on("messageCreate", async message => {
         return message.reply("❌ Please provide a song URL or search query!");
       }
       
-      message.channel.send(`🔍 Searching for: ${args.join(" ")}`);
+      // Send a loading message
+      const loadingMessage = await message.channel.send(`🔍 Searching for: ${args.join(" ")}`);
       
       try {
-        const query = args.join(" ");
-        
-        // Process Spotify URLs for better compatibility
-        if (query.includes("open.spotify.com")) {
-          // Extract the clean Spotify URL without extra parameters
-          const spotifyUrlMatch = query.match(/(https:\/\/open\.spotify\.com\/(?:track|album|playlist)\/[a-zA-Z0-9]+)/);
-          if (spotifyUrlMatch && spotifyUrlMatch[1]) {
-            query = spotifyUrlMatch[1];
-            message.channel.send(`🎵 Detected Spotify URL, optimizing format: ${query}`);
-          }
-        }
+        let query = args.join(" ");
         
         // Handle Spotify URI format (spotify:track:id, spotify:album:id, spotify:playlist:id)
         if (query.startsWith("spotify:")) {
@@ -920,12 +963,22 @@ client.on("messageCreate", async message => {
             const [_, type, id] = parts;
             if (["track", "album", "playlist"].includes(type)) {
               query = `https://open.spotify.com/${type}/${id}`;
-              message.channel.send(`🎵 Converting Spotify URI to URL: ${query}`);
+              await loadingMessage.edit(`🎵 Converting Spotify URI to URL: ${query}`);
             }
           }
         }
+        // Process Spotify URLs for better compatibility
+        else if (query.includes("open.spotify.com")) {
+          // Extract the clean Spotify URL without extra parameters
+          const spotifyUrlMatch = query.match(/(https:\/\/open\.spotify\.com\/(?:track|album|playlist)\/[a-zA-Z0-9]+)/);
+          if (spotifyUrlMatch && spotifyUrlMatch[1]) {
+            query = spotifyUrlMatch[1];
+            await loadingMessage.edit(`🎵 Detected Spotify URL, optimizing format: ${query}`);
+          }
+        }
         
-        // This section is now handled by the previous block
+        // Update loading message to show we're using Lavalink
+        await loadingMessage.edit("🔄 Using Lavalink music system...")
         
         // Try to use Lavalink first (if available)
         try {
@@ -942,43 +995,94 @@ client.on("messageCreate", async message => {
           // Search for the song
           const res = await manager.search(query, message.author);
           
-          // Handle search results
-          if (res.loadType === "LOAD_FAILED") {
-            // If Lavalink fails, fall back to DisTube
-            console.log("Lavalink search failed, falling back to DisTube");
-            throw new Error("Lavalink search failed");
-          } else if (res.loadType === "NO_MATCHES") {
-            // If no matches found, fall back to DisTube
-            console.log("No matches found with Lavalink, falling back to DisTube");
-            throw new Error("No matches found with Lavalink");
-          } else if (res.loadType === "PLAYLIST_LOADED") {
-            // Add all tracks from playlist
-            player.queue.add(res.tracks);
-            
-            // Play the track if not already playing
-            if (!player.playing && !player.paused && !player.queue.size) {
-              player.play();
-            }
-            
-            // Send success message
-            message.channel.send(`✅ Added playlist to queue: **${res.playlist.name}** with ${res.tracks.length} tracks`);
-            return; // Exit early since we successfully used Lavalink
-          } else {
-            // Add the track(s) to the queue
-            player.queue.add(res.tracks[0]);
-            
-            // Play the track if not already playing
-            if (!player.playing && !player.paused && !player.queue.size) {
-              player.play();
-            }
-            
-            // Send success message
-            message.channel.send(`✅ Added to queue: **${res.tracks[0].title}**`);
-            return; // Exit early since we successfully used Lavalink
+          // Handle search results based on load type
+          switch (res.loadType) {
+            case "LOAD_FAILED":
+              throw new Error(`Failed to load track: ${res.exception?.message || "Unknown error"}`);
+              
+            case "NO_MATCHES":
+              throw new Error("No matches found for your query");
+              
+            case "PLAYLIST_LOADED":
+              // Add all tracks from playlist
+              player.queue.add(res.tracks);
+              
+              // Create a rich embed for the playlist
+              const playlistEmbed = new EmbedBuilder()
+                .setColor(0x3498DB)
+                .setTitle(`🎵 Added Playlist to Queue`)
+                .setDescription(`**${res.playlist.name}** with ${res.tracks.length} tracks`)
+                .setThumbnail(res.tracks[0].thumbnail || "https://i.imgur.com/4M7IWwP.png")
+                .addFields(
+                  { name: "Tracks", value: `${res.tracks.length} songs`, inline: true },
+                  { name: "Requested By", value: message.author.tag, inline: true }
+                )
+                .setTimestamp();
+              
+              // Update the loading message with the embed
+              await loadingMessage.edit({ content: "", embeds: [playlistEmbed] });
+              
+              // Play the track if not already playing
+              if (!player.playing && !player.paused && !player.queue.size) {
+                player.play();
+              }
+              return; // Exit early since we successfully used Lavalink
+              
+            default: // TRACK_LOADED or SEARCH_RESULT
+              const track = res.tracks[0];
+              player.queue.add(track);
+              
+              // Create a rich embed for the track
+              const trackEmbed = new EmbedBuilder()
+                .setColor(0x3498DB)
+                .setTitle(`🎵 Added to Queue`)
+                .setDescription(`[${track.title}](${track.uri})`)
+                .setThumbnail(track.thumbnail || "https://i.imgur.com/4M7IWwP.png")
+                .addFields(
+                  { name: "Duration", value: formatLavaDuration(track.duration), inline: true },
+                  { name: "Requested By", value: message.author.tag, inline: true }
+                )
+                .setTimestamp();
+              
+              // Update the loading message with the embed
+              await loadingMessage.edit({ content: "", embeds: [trackEmbed] });
+              
+              // Play the track if not already playing
+              if (!player.playing && !player.paused && !player.queue.size) {
+                player.play();
+              }
+              return; // Exit early since we successfully used Lavalink
           }
         } catch (lavaError) {
-          console.log("Falling back to DisTube due to error:", lavaError.message);
-          // Continue with DisTube as fallback
+          console.error("Lavalink error:", lavaError);
+          
+          // Update the loading message with the error
+          await loadingMessage.edit(`❌ Lavalink error: ${lavaError.message}`);
+          
+          // Only fall back to DisTube if absolutely necessary
+          if (lavaError.message.includes("No matches found") || 
+              lavaError.message.includes("Failed to load track") ||
+              lavaError.message.includes("Lavalink search failed")) {
+            
+            await loadingMessage.edit("⚠️ Lavalink couldn't find the track. Trying with DisTube as fallback...");
+            
+            try {
+              await distube.play(message.member.voice.channel, query, {
+                member: message.member,
+                textChannel: message.channel,
+                message,
+              });
+              
+              // If DisTube succeeds, update the message
+              await loadingMessage.edit("✅ Successfully played with DisTube fallback system");
+              return; // Exit early since we successfully used DisTube
+            } catch (distubeError) {
+              console.error("DisTube error:", distubeError);
+              await loadingMessage.edit(`❌ Both Lavalink and DisTube failed: ${distubeError.message}`);
+              return; // Exit early since both systems failed
+            }
+          }
+          return; // Exit early if we're not falling back to DisTube
         }
         
         // Fall back to DisTube if Lavalink fails
@@ -1426,8 +1530,8 @@ client.on("messageCreate", async message => {
             value: "Interact with the AI assistant",
           },
           {
-            name: "!chat <prompt>",
-            value: "Ask the AI assistant a question or request information",
+            name: "!ai <prompt>",
+            value: "Ask the AI assistant a question or request help",
           },
           // Leveling commands
           {
@@ -1445,15 +1549,6 @@ client.on("messageCreate", async message => {
           {
             name: "!leaderboard",
             value: "View the server's XP leaderboard",
-          },
-          // AI Commands
-          {
-            name: "🤖 AI Commands",
-            value: "Interact with AI assistant",
-          },
-          {
-            name: "!ai <prompt>",
-            value: "Ask the AI assistant a question or request help",
           },
           // Welcome message commands
           {
@@ -1550,31 +1645,87 @@ client.on("messageCreate", async message => {
           return message.reply("❌ No Lavalink nodes are configured.");
         }
         
+        // Send a loading message first
+        const loadingMsg = await message.channel.send("⏳ Checking Lavalink status...");
+        
+        // Create the main status embed
         const statusEmbed = new EmbedBuilder()
           .setColor(0x3498DB)
-          .setTitle('Lavalink Status')
-          .setDescription('Current status of Lavalink nodes:')
-          .setTimestamp();
+          .setTitle('✅ Lavalink Status')
+          .setDescription('Current status of Lavalink music system:')
+          .setTimestamp()
+          .setFooter({ text: 'Lavalink is a powerful audio sending node' });
         
+        // Track overall system health
+        let allNodesConnected = true;
+        let totalPlayers = 0;
+        let totalPlayingPlayers = 0;
+        
+        // Process each node
         nodes.forEach(node => {
-          const status = node.connected ? '🟢 Connected' : '🔴 Disconnected';
-          const stats = node.stats ? 
-            `CPU: ${(node.stats.cpu.systemLoad * 100).toFixed(2)}%\n` +
-            `Memory: ${(node.stats.memory.used / 1024 / 1024).toFixed(2)} MB\n` +
-            `Players: ${node.stats.players}\n` +
-            `Playing: ${node.stats.playingPlayers}`
-            : 'No stats available';
+          const isConnected = node.connected;
+          if (!isConnected) allNodesConnected = false;
           
+          const status = isConnected ? '✅ Connected' : '❌ Disconnected';
+          const statusColor = isConnected ? '🟢' : '🔴';
+          
+          // Format uptime if available
+          let uptime = 'Unknown';
+          if (node.stats && node.stats.uptime) {
+            const uptimeMs = node.stats.uptime;
+            const hours = Math.floor(uptimeMs / 3600000);
+            const minutes = Math.floor((uptimeMs % 3600000) / 60000);
+            uptime = `${hours}h ${minutes}m`;
+          }
+          
+          // Get detailed stats if available
+          let cpuLoad = 'N/A';
+          let memoryUsage = 'N/A';
+          let players = 0;
+          let playingPlayers = 0;
+          
+          if (node.stats) {
+            cpuLoad = `${(node.stats.cpu.systemLoad * 100).toFixed(2)}%`;
+            memoryUsage = `${(node.stats.memory.used / 1024 / 1024).toFixed(2)} MB`;
+            players = node.stats.players;
+            playingPlayers = node.stats.playingPlayers;
+            
+            // Add to totals
+            totalPlayers += players;
+            totalPlayingPlayers += playingPlayers;
+          }
+          
+          // Add field for this node
           statusEmbed.addFields({
-            name: `Node: ${node.options.identifier || 'default'}`,
-            value: `Status: ${status}\nAddress: ${node.options.host}:${node.options.port}\n${stats}`
+            name: `${statusColor} Node: ${node.options.identifier || 'default'}`,
+            value: [
+              `**Status:** ${status}`,
+              `**Address:** ${node.options.host}:${node.options.port}`,
+              `**Uptime:** ${uptime}`,
+              `**CPU Load:** ${cpuLoad}`,
+              `**Memory:** ${memoryUsage}`,
+              `**Players:** ${players} (${playingPlayers} active)`
+            ].join('\n')
           });
         });
         
-        message.reply({ embeds: [statusEmbed] });
+        // Add overall status field
+        statusEmbed.addFields({
+          name: '📊 Overall Status',
+          value: [
+            `**System Status:** ${allNodesConnected ? '✅ All systems operational' : '⚠️ Some nodes disconnected'}`,
+            `**Total Players:** ${totalPlayers}`,
+            `**Active Players:** ${totalPlayingPlayers}`,
+            `**Spotify Integration:** ${process.env.SPOTIFY_CLIENT_ID ? '✅ Enabled' : '❌ Disabled'}`,
+            `**YouTube Cookies:** ${fs.existsSync('./cookies.txt') ? '✅ Configured' : '⚠️ Not configured'}`
+          ].join('\n')
+        });
+        
+        // Update the loading message with the embed
+        await loadingMsg.edit({ content: null, embeds: [statusEmbed] });
       } catch (error) {
         console.error("Error checking Lavalink status:", error);
-        message.reply("❌ An error occurred while checking Lavalink status.");
+        message.reply("❌ An error occurred while checking Lavalink status: " + error.message);
       }
       break;
       
