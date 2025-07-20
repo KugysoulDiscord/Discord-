@@ -520,6 +520,9 @@ const manager = new Manager({
       port: parseInt(process.env.LAVALINK_PORT) || 2333, // Port default Lavalink
       password: process.env.LAVALINK_PASSWORD || "youshallnotpass", // Password dari env atau default
       secure: false,     // Gunakan true jika menggunakan SSL
+      requestTimeout: 30000, // Timeout untuk request (30 detik)
+      retryAmount: 5,    // Jumlah percobaan ulang jika gagal
+      retryDelay: 3000,  // Delay antar percobaan (3 detik)
     },
   ],
   // Fungsi untuk mengirim data ke Discord
@@ -529,6 +532,13 @@ const manager = new Manager({
   },
   // Gunakan YouTube dan Spotify sebagai sumber
   autoPlay: true,
+  // Konfigurasi Spotify
+  spotify: {
+    clientId: process.env.SPOTIFY_CLIENT_ID || "0e7b9b46993d4a9ab295da2da2dc5909",
+    clientSecret: process.env.SPOTIFY_CLIENT_SECRET || "e2199abf29f84e8aa05269aa3710e6ae"
+  },
+  // Konfigurasi YouTube
+  youtubeCookie: fs.existsSync('./cookies.txt') ? fs.readFileSync('./cookies.txt', 'utf8') : null,
 });
 
 // Helper function to format duration for Lavalink
@@ -573,7 +583,7 @@ manager
         .setDescription(`[${track.title}](${track.uri})`)
         .setThumbnail(track.thumbnail || track.displayThumbnail())
         .addFields(
-          { name: "Duration", value: formatDuration(track.duration), inline: true },
+          { name: "Duration", value: formatLavaDuration(track.duration), inline: true },
           { name: "Requested By", value: track.requester.tag, inline: true }
         )
         .setTimestamp();
