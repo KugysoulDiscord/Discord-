@@ -391,9 +391,44 @@ ${cookies.join('\n')}`;
     
     fs.writeFileSync(cookiesPath, cookiesContent);
     console.log("YouTube cookies updated successfully!");
+    
+    // Reload DisTube with new cookies
+    reloadYouTubeCookies();
+    
     return true;
   } catch (error) {
     console.error("Error updating YouTube cookies:", error);
+    return false;
+  }
+}
+
+// Function to reload YouTube cookies in DisTube
+function reloadYouTubeCookies() {
+  try {
+    if (fs.existsSync(cookiesPath)) {
+      const cookieContent = fs.readFileSync(cookiesPath, 'utf8');
+      
+      // Update DisTube's YouTube cookie
+      distube.options.youtubeCookie = cookieContent;
+      
+      // Update YtDlpPlugin options if possible
+      if (distube.options.plugins) {
+        const ytDlpPlugin = distube.options.plugins.find(p => p instanceof YtDlpPlugin);
+        if (ytDlpPlugin) {
+          ytDlpPlugin.options.cookies = cookiesPath;
+          ytDlpPlugin.options.cookieFile = cookiesPath;
+          if (ytDlpPlugin.options.ytdlpOptions) {
+            ytDlpPlugin.options.ytdlpOptions.cookies = cookiesPath;
+          }
+        }
+      }
+      
+      console.log("YouTube cookies reloaded successfully!");
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error("Error reloading YouTube cookies:", error);
     return false;
   }
 }
@@ -496,6 +531,8 @@ function extractYouTubeVideoId(url) {
 const distube = new DisTube(client, {
   nsfw: false,
   emitNewSongOnly: true,
+  youtubeCookie: fs.existsSync(cookiesPath) ? fs.readFileSync(cookiesPath, 'utf8') : null, // Add cookies directly to DisTube
+  youtubeDL: true, // Enable built-in YouTube DL
   plugins: [
     new SpotifyPlugin({
       api: {
@@ -506,6 +543,28 @@ const distube = new DisTube(client, {
     new YtDlpPlugin({
       update: false,
       cookies: cookiesPath, // Use cookies for YouTube access
+      cookieFile: cookiesPath, // Also set cookieFile option
+      requestOptions: {
+        headers: {
+          // Add common YouTube headers to avoid bot detection
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        }
+      },
+      // Add additional YT-DLP options
+      ytdlpOptions: {
+        'cookies': cookiesPath,
+        'no-check-certificate': true,
+        'ignore-errors': true,
+        'no-warnings': true,
+        'prefer-insecure': true,
+        'geo-bypass': true,
+        'add-header': [
+          'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Accept-Language:en-US,en;q=0.9',
+        ],
+      }
     }),
   ],
 });
@@ -568,7 +627,25 @@ distube
     // Check if the error is related to YouTube bot detection
     if (error.message && error.message.includes("Sign in to confirm you're not a bot")) {
       if (channel) {
-        channel.send(`❌ YouTube is asking for verification. Trying to use Innertube API instead...`);
+        // Create a rich embed for the error
+        const embed = new EmbedBuilder()
+          .setColor('#FF0000')
+          .setTitle('YouTube Authentication Error')
+          .setDescription('YouTube is asking for authentication to confirm you\'re not a bot.')
+          .addFields(
+            { name: 'Solution 1', value: 'Use the `!cookies` command to update YouTube cookies' },
+            { name: 'Solution 2', value: 'Wait a few minutes and try again' },
+            { name: 'Solution 3', value: 'Try a different YouTube video' }
+          )
+          .setFooter({ text: 'This is a common YouTube protection mechanism' });
+        
+        channel.send({ embeds: [embed] });
+        
+        // Try to automatically reload cookies
+        const reloadSuccess = reloadYouTubeCookies();
+        if (reloadSuccess) {
+          channel.send('🔄 Automatically reloaded YouTube cookies. Please try your command again.');
+        }
       }
       
       // Try to get the video ID from the error message
@@ -581,28 +658,34 @@ distube
         
         if (videoId) {
           try {
-            // Get video info using Innertube API
+            // Get video info using YouTube Data API
             const videoInfo = await getYouTubeVideoInfo(videoId);
             
             if (channel) {
-              channel.send(`✅ Successfully retrieved video info using Innertube API. Attempting to play...`);
+              // Create a rich embed with video information
+              const videoEmbed = new EmbedBuilder()
+                .setColor('#FF0000')
+                .setTitle(videoInfo.title)
+                .setURL(videoInfo.url)
+                .setAuthor({ name: 'YouTube', iconURL: 'https://www.youtube.com/s/desktop/3a84d4c0/img/favicon_144x144.png' })
+                .setDescription(`By: ${videoInfo.author}`)
+                .setThumbnail(videoInfo.thumbnail)
+                .addFields(
+                  { name: 'Duration', value: formatDuration(videoInfo.duration), inline: true },
+                  { name: 'Views', value: formatNumber(videoInfo.viewCount), inline: true }
+                )
+                .setFooter({ text: 'Video info retrieved using YouTube Data API' });
               
-              // Try to play the video using the direct URL
-              const queue = distube.getQueue(channel.guild);
-              if (queue) {
-                // If there's a queue, add the song to it
-                // This is a simplified implementation and might need more work
-                channel.send(`⚠️ Innertube API implementation is experimental. Please report any issues.`);
-              } else {
-                channel.send(`⚠️ Innertube API implementation is experimental. Please try again with the command.`);
-              }
+              channel.send({ embeds: [videoEmbed] });
+              channel.send(`✅ Successfully retrieved video info. Please try playing this video again after updating cookies.`);
             }
-          } catch (innertubeError) {
-            console.error("Innertube API error:", innertubeError);
+          } catch (youtubeApiError) {
+            console.error("YouTube API error:", youtubeApiError);
             
             if (channel) {
-              channel.send(`❌ Failed to use Innertube API. Please try using the \`!cookies\` command to update your YouTube cookies.
-              
+              channel.send(`❌ Could not retrieve video information: ${youtubeApiError.message}`);
+              channel.send(`Please try using the \`!cookies\` command to update your YouTube cookies.
+
 **How to get your YouTube cookies:**
 1. Login to YouTube in your browser
 2. Open Developer Tools (F12 or right-click > Inspect)
@@ -618,7 +701,16 @@ distube
       } else if (channel) {
         channel.send(`❌ Could not extract URL from the error message. Please try using the \`!cookies\` command.`);
       }
+    } else if (error.message && error.message.includes("YTDLP_ERROR")) {
+      // Handle other yt-dlp errors
+      if (channel) {
+        channel.send(`❌ YouTube-DLP Error: There was an issue playing this video. Please try updating cookies with \`!cookies\` command or try a different video.`);
+        
+        // Try to automatically reload cookies
+        reloadYouTubeCookies();
+      }
     } else if (channel) {
+      // Handle other errors
       channel.send(`❌ Error: ${error.message}`);
     }
   })
@@ -1088,11 +1180,11 @@ client.on("messageCreate", async message => {
           },
           {
             name: "!cookies <cookie_string>",
-            value: "Update YouTube cookies to fix 'Sign in to confirm you're not a bot' error (fallback method)",
+            value: "Update YouTube cookies to fix 'Sign in to confirm you're not a bot' error",
           },
           {
-            name: "YouTube API",
-            value: "Bot now uses YouTube Data API for enhanced video information and reliability",
+            name: "YouTube Integration",
+            value: "Bot uses YouTube Data API for video info and cookies for playback - both are required for reliable operation",
           },
           {
             name: "!stop",
