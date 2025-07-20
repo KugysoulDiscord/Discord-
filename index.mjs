@@ -1,5 +1,5 @@
 import { DisTube } from "distube";
-import { Client, GatewayIntentBits, Partials, ActivityType } from "discord.js";
+import { Client, GatewayIntentBits, Partials, ActivityType, EmbedBuilder, Collection } from "discord.js";
 import { SpotifyPlugin } from "@distube/spotify";
 import { YtDlpPlugin } from "@distube/yt-dlp";
 import express from "express";
@@ -11,9 +11,51 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { execSync } from "child_process";
 import fetch from "node-fetch";
+import mongoose from "mongoose";
+import { setTimeout } from "timers/promises";
+import { 
+  joinVoiceChannel, 
+  createAudioPlayer, 
+  createAudioResource, 
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  NoSubscriberBehavior,
+  getVoiceConnection,
+  entersState
+} from "@discordjs/voice";
 
 // Load environment variables
 dotenv.config();
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+}).then(() => {
+  console.log('Connected to MongoDB');
+}).catch((err) => {
+  console.error('MongoDB connection error:', err);
+});
+
+// Create user schema for leveling system
+const userSchema = new mongoose.Schema({
+  userId: { type: String, required: true, unique: true },
+  guildId: { type: String, required: true },
+  xp: { type: Number, default: 0 },
+  level: { type: Number, default: 0 },
+  lastMessageTimestamp: { type: Date, default: Date.now }
+});
+
+// Create welcome message schema
+const guildSchema = new mongoose.Schema({
+  guildId: { type: String, required: true, unique: true },
+  welcomeChannelId: { type: String, default: null },
+  welcomeMessage: { type: String, default: "Welcome to the server, {user}!" }
+});
+
+// Create models
+const User = mongoose.model('User', userSchema);
+const Guild = mongoose.model('Guild', guildSchema);
 
 // Get the directory name of the current module
 const __filename = fileURLToPath(import.meta.url);
@@ -39,6 +81,97 @@ if (!fs.existsSync(cookiesPath)) {
   console.log("Created default cookies.txt file for YouTube access");
 }
 
+// AI function using OpenRouter API (using Llama or Gemini models)
+async function generateAIResponse(prompt) {
+  try {
+    // Use Llama model from OpenRouter
+    const model = "meta-llama/llama-3-8b-instruct"; // Affordable Llama model
+    
+    const systemPrompt = `You are a friendly, helpful, and knowledgeable AI assistant in a Discord server.
+
+Guidelines:
+- Be conversational, warm, and engaging while maintaining a helpful tone
+- Provide concise but informative responses
+- Use appropriate emojis occasionally to make your responses more engaging
+- Be respectful and considerate of all users
+- If you don't know something, be honest about it
+- Avoid controversial topics and maintain a positive atmosphere
+- Adapt your tone to match the user's query - be professional for serious questions and more casual for light conversation
+- Format your responses clearly with spacing between paragraphs for readability
+
+Remember that you're here to assist users in a friendly and helpful manner!`;
+    
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: prompt }
+        ],
+        max_tokens: 500
+      })
+    });
+
+    const data = await response.json();
+    
+    if (data.error) {
+      console.error("OpenRouter API error:", data.error);
+      return "Sorry, I encountered an error while processing your request.";
+    }
+    
+    return data.choices[0].message.content.trim();
+  } catch (error) {
+    console.error("AI generation error:", error);
+    return "Sorry, I encountered an error while processing your request.";
+  }
+}
+
+// Function to add XP to a user
+async function addXP(userId, guildId, xpToAdd = 5) {
+  try {
+    // Find the user in the database or create a new one
+    let user = await User.findOne({ userId, guildId });
+    
+    // If user doesn't exist, create a new one
+    if (!user) {
+      user = new User({ userId, guildId });
+    }
+    
+    // Check if enough time has passed since the last message (to prevent spam)
+    const now = new Date();
+    const timeDiff = now - user.lastMessageTimestamp;
+    if (timeDiff < 60000) { // 1 minute cooldown
+      return null;
+    }
+    
+    // Update user's XP and timestamp
+    user.xp += xpToAdd;
+    user.lastMessageTimestamp = now;
+    
+    // Calculate level based on XP (simple formula: level = sqrt(xp / 100))
+    const newLevel = Math.floor(Math.sqrt(user.xp / 100));
+    
+    // Check if user leveled up
+    const leveledUp = newLevel > user.level;
+    if (leveledUp) {
+      user.level = newLevel;
+    }
+    
+    // Save the user
+    await user.save();
+    
+    return leveledUp ? user.level : null;
+  } catch (error) {
+    console.error("Error adding XP:", error);
+    return null;
+  }
+}
+
 // Create a new client instance with properly defined intents
 const client = new Client({
   partials: [
@@ -53,6 +186,7 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildPresences,
   ],
 });
 
@@ -67,6 +201,7 @@ const globalState = {
   ffmpegStatus: "unknown",
   voiceConnectionStatus: "disconnected",
   guildId: null,
+  radioPlayers: new Map(), // Map to store radio players for each guild
 };
 
 // Check if FFmpeg is installed
@@ -88,6 +223,150 @@ async function checkFFmpeg() {
 
 // Call the function to check FFmpeg
 checkFFmpeg();
+
+// Radio functions
+function createRadioPlayer(url) {
+  const player = createAudioPlayer({
+    behaviors: {
+      noSubscriber: NoSubscriberBehavior.Play,
+    },
+  });
+  
+  const resource = createAudioResource(url);
+  player.play(resource);
+  
+  // Handle player state changes
+  player.on(AudioPlayerStatus.Idle, () => {
+    // If the stream ends, recreate it (for continuous playback)
+    const newResource = createAudioResource(url);
+    player.play(newResource);
+  });
+  
+  player.on('error', error => {
+    console.error(`Error with radio player: ${error.message}`);
+    // Try to reconnect
+    const newResource = createAudioResource(url);
+    player.play(newResource);
+  });
+  
+  return player;
+}
+
+function playRadio(message, url, radioName) {
+  // Check if user is in a voice channel
+  const voiceChannel = message.member.voice.channel;
+  if (!voiceChannel) {
+    return message.reply('❌ You need to be in a voice channel to play radio!');
+  }
+  
+  try {
+    // Check if there's already a connection in this guild
+    let connection = getVoiceConnection(message.guild.id);
+    
+    // If there's a connection but it's for DisTube, destroy it first
+    if (connection && !globalState.radioPlayers.has(message.guild.id)) {
+      connection.destroy();
+      connection = null;
+    }
+    
+    // If no connection exists, create one
+    if (!connection) {
+      connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: message.guild.id,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
+      
+      // Handle connection state changes
+      connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        try {
+          // Try to reconnect
+          await Promise.race([
+            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+        } catch (error) {
+          // If we can't reconnect, destroy the connection
+          connection.destroy();
+          globalState.radioPlayers.delete(message.guild.id);
+        }
+      });
+    }
+    
+    // Create a player if one doesn't exist for this guild
+    if (!globalState.radioPlayers.has(message.guild.id)) {
+      const player = createRadioPlayer(url);
+      globalState.radioPlayers.set(message.guild.id, { player, radioName });
+      
+      // Subscribe the connection to the player
+      connection.subscribe(player);
+      
+      // Create an embed for the radio
+      const radioEmbed = new EmbedBuilder()
+        .setColor(0x3498DB)
+        .setTitle(`📻 Radio Started: ${radioName}`)
+        .setDescription(`Now playing ${radioName} in ${voiceChannel.name}`)
+        .setFooter({ text: 'Use !stop to stop the radio' })
+        .setTimestamp();
+      
+      message.reply({ embeds: [radioEmbed] });
+    } else {
+      // If a player exists, update it with the new radio
+      const { player } = globalState.radioPlayers.get(message.guild.id);
+      player.stop();
+      
+      const resource = createAudioResource(url);
+      player.play(resource);
+      
+      // Update the radio info
+      globalState.radioPlayers.set(message.guild.id, { player, radioName });
+      
+      // Create an embed for the radio change
+      const radioEmbed = new EmbedBuilder()
+        .setColor(0x3498DB)
+        .setTitle(`📻 Radio Changed: ${radioName}`)
+        .setDescription(`Now playing ${radioName} in ${voiceChannel.name}`)
+        .setFooter({ text: 'Use !stop to stop the radio' })
+        .setTimestamp();
+      
+      message.reply({ embeds: [radioEmbed] });
+    }
+  } catch (error) {
+    console.error('Error playing radio:', error);
+    message.reply('❌ An error occurred while trying to play the radio.');
+  }
+}
+
+function stopRadio(message) {
+  // Check if there's a radio player for this guild
+  if (!globalState.radioPlayers.has(message.guild.id)) {
+    return message.reply('❌ No radio is currently playing!');
+  }
+  
+  try {
+    // Get the connection
+    const connection = getVoiceConnection(message.guild.id);
+    if (connection) {
+      // Destroy the connection
+      connection.destroy();
+    }
+    
+    // Remove the player from the map
+    globalState.radioPlayers.delete(message.guild.id);
+    
+    // Create an embed for stopping the radio
+    const stopEmbed = new EmbedBuilder()
+      .setColor(0x3498DB)
+      .setTitle('📻 Radio Stopped')
+      .setDescription('The radio has been stopped.')
+      .setTimestamp();
+    
+    message.reply({ embeds: [stopEmbed] });
+  } catch (error) {
+    console.error('Error stopping radio:', error);
+    message.reply('❌ An error occurred while trying to stop the radio.');
+  }
+}
 
 // Function to manually update YouTube cookies
 function updateYouTubeCookies(cookieString) {
@@ -206,7 +485,12 @@ const distube = new DisTube(client, {
   nsfw: false,
   emitNewSongOnly: true,
   plugins: [
-    new SpotifyPlugin(),
+    new SpotifyPlugin({
+      api: {
+        clientId: "0e7b9b46993d4a9ab295da2da2dc5909",
+        clientSecret: "e2199abf29f84e8aa05269aa3710e6ae",
+      }
+    }),
     new YtDlpPlugin({
       update: false,
       cookies: cookiesPath, // Use cookies for YouTube access
@@ -392,12 +676,77 @@ client.once("ready", () => {
     activities: [{ name: "!help for commands", type: ActivityType.Listening }],
     status: "online",
   });
+  
+  // Check and create guild settings for all guilds
+  client.guilds.cache.forEach(async (guild) => {
+    try {
+      const guildSettings = await Guild.findOne({ guildId: guild.id });
+      if (!guildSettings) {
+        const newGuild = new Guild({ guildId: guild.id });
+        await newGuild.save();
+        console.log(`Created settings for guild: ${guild.name}`);
+      }
+    } catch (error) {
+      console.error(`Error creating settings for guild ${guild.name}:`, error);
+    }
+  });
+});
+
+// Handle new guild members (welcome message)
+client.on("guildMemberAdd", async (member) => {
+  try {
+    // Get guild settings
+    const guildSettings = await Guild.findOne({ guildId: member.guild.id });
+    
+    // If no settings or no welcome channel set, return
+    if (!guildSettings || !guildSettings.welcomeChannelId) return;
+    
+    // Get the welcome channel
+    const welcomeChannel = member.guild.channels.cache.get(guildSettings.welcomeChannelId);
+    if (!welcomeChannel) return;
+    
+    // Replace placeholders in welcome message
+    const welcomeMessage = guildSettings.welcomeMessage
+      .replace(/{user}/g, `<@${member.id}>`)
+      .replace(/{username}/g, member.user.username)
+      .replace(/{server}/g, member.guild.name)
+      .replace(/{membercount}/g, member.guild.memberCount);
+    
+    // Create a welcome embed
+    const welcomeEmbed = new EmbedBuilder()
+      .setColor(0x3498DB)
+      .setTitle(`Welcome to ${member.guild.name}!`)
+      .setDescription(welcomeMessage)
+      .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+      .setFooter({ text: `Member #${member.guild.memberCount}` })
+      .setTimestamp();
+    
+    // Send the welcome message
+    welcomeChannel.send({ embeds: [welcomeEmbed] });
+  } catch (error) {
+    console.error("Error sending welcome message:", error);
+  }
 });
 
 // Create a message event listener
 client.on("messageCreate", async message => {
   // Ignore messages from bots
   if (message.author.bot) return;
+  
+  // Handle XP and leveling for regular messages
+  if (message.guild) {
+    const leveledUp = await addXP(message.author.id, message.guild.id);
+    if (leveledUp) {
+      const levelEmbed = new EmbedBuilder()
+        .setColor(0x3498DB)
+        .setTitle('Level Up!')
+        .setDescription(`Congratulations ${message.author}! You've reached level **${leveledUp}**!`)
+        .setThumbnail(message.author.displayAvatarURL({ dynamic: true }))
+        .setTimestamp();
+      
+      message.channel.send({ embeds: [levelEmbed] });
+    }
+  }
   
   // Check if the message starts with the prefix
   const prefix = "!";
@@ -663,12 +1012,21 @@ client.on("messageCreate", async message => {
       
     case "help":
       const helpEmbed = {
-        title: "🎵 Music Bot Commands",
+        title: "🤖 Bot Commands",
         description: "Here are the available commands:",
         fields: [
+          // Music commands
+          {
+            name: "🎵 Music Commands",
+            value: "Control music playback in voice channels",
+          },
           {
             name: "!play <song>",
             value: "Play a song from YouTube, Spotify, or a search query",
+          },
+          {
+            name: "!play spotify:<url>",
+            value: "Play a song from Spotify (supports tracks, albums, playlists)",
           },
           {
             name: "!cookies <cookie_string>",
@@ -686,9 +1044,60 @@ client.on("messageCreate", async message => {
             name: "!pause",
             value: "Pause the current song",
           },
+          // AI commands
+          {
+            name: "🧠 AI Commands",
+            value: "Interact with the AI assistant",
+          },
+          {
+            name: "!chat <prompt>",
+            value: "Ask the AI assistant a question or request information",
+          },
+          // Leveling commands
+          {
+            name: "📊 Leveling Commands",
+            value: "Check your level and XP",
+          },
+          {
+            name: "!level",
+            value: "Check your current level and XP",
+          },
+          {
+            name: "!rank <@user>",
+            value: "Check another user's level and XP",
+          },
+          // Welcome message commands
+          {
+            name: "👋 Welcome Message Commands",
+            value: "Configure welcome messages for new members",
+          },
+          {
+            name: "!welcome channel <#channel>",
+            value: "Set the channel for welcome messages",
+          },
+          {
+            name: "!welcome message <message>",
+            value: "Set the welcome message (use {user}, {username}, {server}, {membercount} as placeholders)",
+          },
+          {
+            name: "!welcome test",
+            value: "Test the welcome message",
+          },
           {
             name: "!resume",
             value: "Resume the paused song",
+          },
+          {
+            name: "!radio",
+            value: "Play 24/7 lofi radio stream",
+          },
+          {
+            name: "!radioindo",
+            value: "Play 24/7 Indonesian radio stream",
+          },
+          {
+            name: "!stop",
+            value: "Stop the current music or radio",
           },
           {
             name: "!queue",
@@ -713,6 +1122,210 @@ client.on("messageCreate", async message => {
       };
       
       message.channel.send({ embeds: [helpEmbed] });
+      break;
+      
+    // AI command
+    case "chat":
+      if (!args.length) {
+        return message.reply("❓ Please provide a prompt for the AI!");
+      }
+      
+      // Show typing indicator while generating response
+      message.channel.sendTyping();
+      
+      try {
+        const prompt = args.join(" ");
+        const response = await generateAIResponse(prompt);
+        
+        // Create an embed for the AI response
+        const aiEmbed = new EmbedBuilder()
+          .setColor(0x3498DB)
+          .setTitle('AI Response')
+          .setDescription(response)
+          .setFooter({ text: 'Powered by OpenRouter AI' })
+          .setTimestamp();
+        
+        message.reply({ embeds: [aiEmbed] });
+      } catch (error) {
+        console.error("AI command error:", error);
+        message.reply("❌ Sorry, I encountered an error while processing your request.");
+      }
+      break;
+      
+    // Level command
+    case "level":
+    case "rank":
+      try {
+        // Get the target user (mentioned user or command author)
+        const targetUser = message.mentions.users.first() || message.author;
+        
+        // Get user data from database
+        const userData = await User.findOne({ 
+          userId: targetUser.id, 
+          guildId: message.guild.id 
+        });
+        
+        if (!userData) {
+          return message.reply(`${targetUser.username} hasn't earned any XP yet!`);
+        }
+        
+        // Calculate progress to next level
+        const nextLevelXP = Math.pow((userData.level + 1), 2) * 100;
+        const currentXP = userData.xp;
+        const progressPercentage = Math.min(100, Math.floor((currentXP / nextLevelXP) * 100));
+        
+        // Create progress bar
+        const progressBarLength = 20;
+        const filledBlocks = Math.floor((progressPercentage / 100) * progressBarLength);
+        const progressBar = '█'.repeat(filledBlocks) + '░'.repeat(progressBarLength - filledBlocks);
+        
+        // Create level embed
+        const levelEmbed = new EmbedBuilder()
+          .setColor(0x3498DB)
+          .setTitle(`${targetUser.username}'s Level`)
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .addFields(
+            { name: 'Level', value: `${userData.level}`, inline: true },
+            { name: 'XP', value: `${currentXP}/${nextLevelXP}`, inline: true },
+            { name: 'Progress', value: `${progressBar} ${progressPercentage}%` }
+          )
+          .setFooter({ text: `Requested by ${message.author.username}` })
+          .setTimestamp();
+        
+        message.reply({ embeds: [levelEmbed] });
+      } catch (error) {
+        console.error("Level command error:", error);
+        message.reply("❌ An error occurred while fetching level data.");
+      }
+      break;
+      
+    // Welcome message configuration
+    // Radio commands
+    case "radio":
+      playRadio(message, "https://lofi.stream.laut.fm/lofi", "Lofi Radio");
+      break;
+      
+    case "radioindo":
+      playRadio(message, "https://radione.top:8888/dmi", "Indonesian Radio");
+      break;
+      
+    case "stop":
+      // Check if we're playing radio
+      if (globalState.radioPlayers.has(message.guild.id)) {
+        stopRadio(message);
+      } else {
+        // If not radio, use DisTube to stop music
+        const queue = distube.getQueue(message);
+        if (!queue) return message.reply("❌ Nothing is playing!");
+        
+        try {
+          distube.stop(message);
+          message.reply("⏹️ Stopped the music!");
+        } catch (error) {
+          console.error("Stop error:", error);
+          message.reply("❌ An error occurred while trying to stop the music.");
+        }
+      }
+      break;
+      
+    case "welcome":
+      // Check if user has admin permissions
+      if (!message.member.permissions.has("ADMINISTRATOR")) {
+        return message.reply("❌ You need administrator permissions to use this command!");
+      }
+      
+      if (!args.length) {
+        return message.reply("❓ Please specify a subcommand: `channel`, `message`, or `test`");
+      }
+      
+      const subCommand = args.shift().toLowerCase();
+      
+      switch (subCommand) {
+        case "channel":
+          // Set welcome channel
+          const channel = message.mentions.channels.first();
+          if (!channel) {
+            return message.reply("❓ Please mention a channel: `!welcome channel #welcome`");
+          }
+          
+          try {
+            await Guild.findOneAndUpdate(
+              { guildId: message.guild.id },
+              { welcomeChannelId: channel.id },
+              { upsert: true }
+            );
+            
+            message.reply(`✅ Welcome channel set to ${channel}`);
+          } catch (error) {
+            console.error("Welcome channel error:", error);
+            message.reply("❌ An error occurred while setting the welcome channel.");
+          }
+          break;
+          
+        case "message":
+          // Set welcome message
+          if (!args.length) {
+            return message.reply("❓ Please provide a welcome message. You can use `{user}`, `{username}`, `{server}`, and `{membercount}` as placeholders.");
+          }
+          
+          const welcomeMessage = args.join(" ");
+          
+          try {
+            await Guild.findOneAndUpdate(
+              { guildId: message.guild.id },
+              { welcomeMessage },
+              { upsert: true }
+            );
+            
+            message.reply(`✅ Welcome message set to: ${welcomeMessage}`);
+          } catch (error) {
+            console.error("Welcome message error:", error);
+            message.reply("❌ An error occurred while setting the welcome message.");
+          }
+          break;
+          
+        case "test":
+          // Test welcome message
+          try {
+            const guildSettings = await Guild.findOne({ guildId: message.guild.id });
+            
+            if (!guildSettings || !guildSettings.welcomeChannelId) {
+              return message.reply("❌ Welcome channel not set. Use `!welcome channel #channel` first.");
+            }
+            
+            const welcomeChannel = message.guild.channels.cache.get(guildSettings.welcomeChannelId);
+            if (!welcomeChannel) {
+              return message.reply("❌ Welcome channel not found. It may have been deleted.");
+            }
+            
+            // Replace placeholders in welcome message
+            const testMessage = guildSettings.welcomeMessage
+              .replace(/{user}/g, `<@${message.author.id}>`)
+              .replace(/{username}/g, message.author.username)
+              .replace(/{server}/g, message.guild.name)
+              .replace(/{membercount}/g, message.guild.memberCount);
+            
+            // Create a welcome embed
+            const testEmbed = new EmbedBuilder()
+              .setColor(0x3498DB)
+              .setTitle(`Welcome to ${message.guild.name}!`)
+              .setDescription(testMessage)
+              .setThumbnail(message.author.displayAvatarURL({ dynamic: true }))
+              .setFooter({ text: `Member #${message.guild.memberCount}` })
+              .setTimestamp();
+            
+            // Send the test welcome message
+            welcomeChannel.send({ embeds: [testEmbed] });
+            message.reply(`✅ Test welcome message sent to ${welcomeChannel}`);
+          } catch (error) {
+            console.error("Welcome test error:", error);
+            message.reply("❌ An error occurred while testing the welcome message.");
+          }
+          break;
+          
+        default:
+          message.reply("❓ Unknown subcommand. Use `channel`, `message`, or `test`.");
+      }
       break;
       
     default:
