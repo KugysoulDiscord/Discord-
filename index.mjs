@@ -487,8 +487,8 @@ const distube = new DisTube(client, {
   plugins: [
     new SpotifyPlugin({
       api: {
-        clientId: process.env.SPOTIFY_CLIENT_ID,
-        clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+        clientId: "0e7b9b46993d4a9ab295da2da2dc5909",
+        clientSecret: "e2199abf29f84e8aa05269aa3710e6ae",
       }
     }),
     new YtDlpPlugin({
