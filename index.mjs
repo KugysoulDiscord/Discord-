@@ -398,78 +398,91 @@ ${cookies.join('\n')}`;
   }
 }
 
-// Function to get YouTube video info using Innertube API
+// Function to get YouTube video info using YouTube Data API v3
 async function getYouTubeVideoInfo(videoId) {
   try {
-    // First, get the API key from the YouTube page
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    const response = await fetch(videoUrl);
-    const html = await response.text();
+    // Use YouTube Data API v3 instead of Innertube API
+    const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
     
-    // Extract the INNERTUBE_API_KEY
-    const apiKeyMatch = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-    if (!apiKeyMatch || !apiKeyMatch[1]) {
-      throw new Error("Could not extract INNERTUBE_API_KEY");
+    if (!YOUTUBE_API_KEY) {
+      throw new Error("YouTube API key is not configured. Please set YOUTUBE_API_KEY in your .env file.");
     }
     
-    const apiKey = apiKeyMatch[1];
-    
-    // Make a request to the Innertube API using Android client
-    const playerResponse = await fetch(`https://youtubei.googleapis.com/youtubei/v1/player?key=${apiKey}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Mobile Safari/537.36",
-        "X-YouTube-Client-Name": "3",
-        "X-YouTube-Client-Version": "16.20",
-      },
-      body: JSON.stringify({
-        context: {
-          client: {
-            clientName: "ANDROID",
-            clientVersion: "16.20",
-            androidSdkVersion: 30,
-            userAgent: "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Mobile Safari/537.36",
-          },
-        },
-        videoId: videoId,
-      }),
-    });
-    
-    const data = await playerResponse.json();
-    
-    // Check if we got a valid response
-    if (!data || !data.streamingData || !data.streamingData.adaptiveFormats) {
-      throw new Error("Invalid response from Innertube API");
-    }
-    
-    // Find the audio format with the highest bitrate
-    const audioFormats = data.streamingData.adaptiveFormats.filter(
-      format => format.mimeType.includes("audio")
+    // Get video details using YouTube Data API
+    const videoResponse = await fetch(
+      `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&part=snippet,contentDetails,statistics&key=${YOUTUBE_API_KEY}`
     );
     
-    if (audioFormats.length === 0) {
-      throw new Error("No audio formats found");
+    const videoData = await videoResponse.json();
+    
+    // Check if we got a valid response
+    if (!videoData || !videoData.items || videoData.items.length === 0) {
+      throw new Error("Video not found or API quota exceeded");
     }
     
-    // Sort by bitrate (highest first)
-    audioFormats.sort((a, b) => b.bitrate - a.bitrate);
+    // Get video details
+    const video = videoData.items[0];
+    const title = video.snippet.title;
+    const author = video.snippet.channelTitle;
     
-    // Get the best audio format
-    const bestAudioFormat = audioFormats[0];
+    // Convert ISO 8601 duration to seconds
+    const duration = video.contentDetails.duration;
+    const durationInSeconds = convertISO8601ToSeconds(duration);
     
-    // Return the audio URL and video details
+    // Get thumbnail (highest quality available)
+    const thumbnails = video.snippet.thumbnails;
+    const thumbnail = thumbnails.maxres?.url || 
+                     thumbnails.high?.url || 
+                     thumbnails.medium?.url || 
+                     thumbnails.default?.url ||
+                     `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+    
+    console.log(`✅ Successfully retrieved video info for "${title}" by ${author} using YouTube Data API`);
+    
+    // Return video information in the same format as before
     return {
-      url: bestAudioFormat.url,
-      title: data.videoDetails.title,
-      author: data.videoDetails.author,
-      duration: parseInt(data.videoDetails.lengthSeconds),
-      thumbnail: data.videoDetails.thumbnail.thumbnails.pop().url,
+      url: `https://www.youtube.com/watch?v=${videoId}`, // We don't get direct audio URL from Data API
+      title: title,
+      author: author,
+      duration: durationInSeconds,
+      thumbnail: thumbnail,
+      viewCount: video.statistics.viewCount,
+      videoId: videoId
     };
   } catch (error) {
     console.error("Error getting YouTube video info:", error);
     throw error;
   }
+}
+
+// Helper function to convert ISO 8601 duration to seconds
+function convertISO8601ToSeconds(duration) {
+  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 0;
+  
+  const hours = parseInt(match[1] || 0);
+  const minutes = parseInt(match[2] || 0);
+  const seconds = parseInt(match[3] || 0);
+  
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+// Helper function to format duration in HH:MM:SS format
+function formatDuration(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  } else {
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+  }
+}
+
+// Helper function to format numbers with commas
+function formatNumber(num) {
+  return parseInt(num).toLocaleString();
 }
 
 // Function to check if a URL is a YouTube URL and extract the video ID
@@ -778,7 +791,23 @@ client.on("messageCreate", async message => {
           try {
             // Try to get video info using Innertube API first
             const videoInfo = await getYouTubeVideoInfo(videoId);
-            message.channel.send(`✅ Successfully retrieved video info using Innertube API. Attempting to play...`);
+            
+            // Create a rich embed with video information
+            const embed = new EmbedBuilder()
+              .setColor('#FF0000')
+              .setTitle(videoInfo.title)
+              .setURL(videoInfo.url)
+              .setAuthor({ name: 'YouTube', iconURL: 'https://www.youtube.com/s/desktop/3a84d4c0/img/favicon_144x144.png' })
+              .setDescription(`By: ${videoInfo.author}`)
+              .setThumbnail(videoInfo.thumbnail)
+              .addFields(
+                { name: 'Duration', value: formatDuration(videoInfo.duration), inline: true },
+                { name: 'Views', value: formatNumber(videoInfo.viewCount), inline: true }
+              )
+              .setFooter({ text: 'Powered by YouTube Data API' });
+            
+            message.channel.send({ embeds: [embed] });
+            message.channel.send(`✅ Successfully retrieved video info using YouTube Data API. Attempting to play...`);
             
             // Continue with normal DisTube play as it should work now
             await distube.play(message.member.voice.channel, url, {
@@ -786,12 +815,23 @@ client.on("messageCreate", async message => {
               textChannel: message.channel,
               message,
             });
-          } catch (innertubeError) {
-            console.error("Innertube API error:", innertubeError);
+          } catch (youtubeApiError) {
+            console.error("YouTube API error:", youtubeApiError);
+            
+            // Check if it's an API key issue
+            if (youtubeApiError.message.includes("API key is not configured")) {
+              message.channel.send(`❌ YouTube API key is not configured. Please ask the bot owner to set up the YouTube API key.`);
+              return;
+            }
+            
+            // Check if it's a quota exceeded issue
+            if (youtubeApiError.message.includes("API quota exceeded")) {
+              message.channel.send(`⚠️ YouTube API quota exceeded. Falling back to normal playback...`);
+            } else {
+              message.channel.send(`⚠️ YouTube API error: ${youtubeApiError.message}. Falling back to normal playback...`);
+            }
             
             // Fall back to normal DisTube play
-            message.channel.send(`⚠️ Innertube API failed. Falling back to normal playback...`);
-            
             await distube.play(message.member.voice.channel, url, {
               member: message.member,
               textChannel: message.channel,
@@ -1048,7 +1088,11 @@ client.on("messageCreate", async message => {
           },
           {
             name: "!cookies <cookie_string>",
-            value: "Update YouTube cookies to fix 'Sign in to confirm you're not a bot' error",
+            value: "Update YouTube cookies to fix 'Sign in to confirm you're not a bot' error (fallback method)",
+          },
+          {
+            name: "YouTube API",
+            value: "Bot now uses YouTube Data API for enhanced video information and reliability",
           },
           {
             name: "!stop",
