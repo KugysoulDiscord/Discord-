@@ -537,8 +537,6 @@ const manager = new Manager({
     clientId: process.env.SPOTIFY_CLIENT_ID || "0e7b9b46993d4a9ab295da2da2dc5909",
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET || "e2199abf29f84e8aa05269aa3710e6ae"
   },
-  // Konfigurasi YouTube
-  youtubeCookie: fs.existsSync('./cookies.txt') ? fs.readFileSync('./cookies.txt', 'utf8') : null,
 });
 
 // Helper function to format duration for Lavalink
@@ -791,6 +789,20 @@ client.once("ready", () => {
   // Initialize Lavalink
   manager.init(client.user.id);
   console.log("Lavalink manager initialized");
+  
+  // Load YouTube cookies for DisTube if available
+  if (fs.existsSync('./cookies.txt')) {
+    try {
+      const cookiesContent = fs.readFileSync('./cookies.txt', 'utf8');
+      console.log("YouTube cookies file found, applying to DisTube");
+      // Update DisTube's YouTube cookies
+      if (distube.options && distube.options.youtubeDL) {
+        distube.options.youtubeDL.cookies = cookiesContent;
+      }
+    } catch (error) {
+      console.error("Error loading YouTube cookies:", error);
+    }
+  }
   
   // Check and create guild settings for all guilds
   client.guilds.cache.forEach(async (guild) => {
